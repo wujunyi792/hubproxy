@@ -18,7 +18,7 @@
 - 🛡️ **智能限流** - IP 限流保护，防止滥用
 - 🚫 **仓库审计** - 强大的自定义黑名单，白名单，同时审计镜像仓库，和GitHub仓库
 - 🔍 **镜像搜索** - 在线搜索 Docker 镜像
-- ⚡ **轻量高效** - 基于 Go 语言，单二进制文件运行，资源占用低。
+- ⚡ **轻量高效** - 基于 Go 语言，容器镜像部署简单，资源占用低。
 - 🔧 **统一配置** - 统一配置管理，便于维护。
 - 🛡️ **完全自托管** - 避免依赖免费第三方服务的不稳定性，例如`cloudflare`等等。
 - 🚀 **多服务统一加速** - 单个程序即可统一加速 Docker、GitHub、Hugging Face 等多种服务，简化部署与管理。
@@ -40,70 +40,29 @@ docker run -d \
   ghcr.io/wujunyi792/hubproxy
 ```
 
-### 脚本安装
+### Docker Compose
 
-自动识别系统与架构，从 GitHub Releases 下载对应的 `.deb`、`.rpm` 或 `.apk` 安装包：
+仓库内置 `docker-compose.yml`，默认使用 `ghcr.io/wujunyi792/hubproxy:latest`，并挂载 `src/config.toml`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wujunyi792/hubproxy/main/install.sh | sh
+docker compose up -d
 ```
-
-安装包会自动安装并启动 `hubproxy` 服务。
-
-<details>
-  <summary>服务管理命令</summary>
-
-#### systemd（Debian / Ubuntu / RHEL / CentOS / Fedora）
 
 ```bash
 # 查看状态
-sudo systemctl status hubproxy
+docker compose ps
 
 # 重启服务
-sudo systemctl restart hubproxy
+docker compose restart hubproxy
 
 # 查看实时日志
-sudo journalctl -u hubproxy -f
-
-# 编辑配置文件
-sudo nano /etc/hubproxy/config.toml
-
-# 卸载服务
-sudo apt remove hubproxy
-
-# 连配置一起清理
-sudo apt purge hubproxy
+docker compose logs -f hubproxy
 ```
-
-#### OpenRC（Alpine Linux）
-
-```bash
-# 查看状态
-sudo rc-service hubproxy status
-
-# 重启服务
-sudo rc-service hubproxy restart
-
-# 查看实时日志
-sudo tail -f /var/log/hubproxy.log
-
-# 编辑配置文件
-sudo vi /etc/hubproxy/config.toml
-
-# 卸载
-sudo apk del hubproxy
-```
-
-</details>
 
 ### 文件路径
 
-- Linux 安装包配置文件：`/etc/hubproxy/config.toml`
-- Linux 安装包二进制文件：`/usr/bin/hubproxy`
-- systemd 服务文件：`/lib/systemd/system/hubproxy.service`
-- Alpine OpenRC 服务文件：`/etc/init.d/hubproxy`
-- Alpine 日志文件：`/var/log/hubproxy.log`
-- Alpine 日志轮转配置：`/etc/logrotate.d/hubproxy`
+- Docker Compose 配置文件：`docker-compose.yml`
+- HubProxy 配置文件：`src/config.toml`，容器内路径为 `/app/config.toml`
 
 ## 使用方法
 

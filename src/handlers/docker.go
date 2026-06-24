@@ -66,6 +66,24 @@ func (rd *RegistryDetector) getRegistryMapping(domain string) (config.RegistryMa
 
 var registryDetector = &RegistryDetector{}
 
+func logDockerProxy(c *gin.Context, format string, args ...interface{}) {
+	logArgs := append([]interface{}{
+		c.ClientIP(),
+		c.Request.Method,
+		c.Request.Host,
+		c.Request.URL.Path,
+		c.Request.URL.RawQuery,
+	}, args...)
+	fmt.Printf(
+		"[docker-proxy] client=%s method=%s host=%s path=%s query=%s "+format+"\n",
+		logArgs...,
+	)
+}
+
+func hasAuthorization(c *gin.Context) bool {
+	return strings.TrimSpace(c.GetHeader("Authorization")) != ""
+}
+
 // InitDockerProxy 初始化Docker代理
 func InitDockerProxy() {
 	registry, err := name.NewRegistry("registry-1.docker.io")
@@ -91,6 +109,7 @@ func ProxyDockerRegistryGin(c *gin.Context) {
 	path := c.Request.URL.Path
 
 	if path == "/v2/" {
+		logDockerProxy(c, "event=v2_ping status=200")
 		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
@@ -98,6 +117,7 @@ func ProxyDockerRegistryGin(c *gin.Context) {
 	if strings.HasPrefix(path, "/v2/") {
 		handleRegistryRequest(c, path)
 	} else {
+		logDockerProxy(c, "event=non_registry_path status=404")
 		c.String(http.StatusNotFound, "Docker Registry API v2 only")
 	}
 }
@@ -110,6 +130,7 @@ func handleRegistryRequest(c *gin.Context, path string) {
 		if registryDetector.isRegistryEnabled(registryDomain) {
 			c.Set("target_registry_domain", registryDomain)
 			c.Set("target_path", remainingPath)
+			logDockerProxy(c, "event=registry_route registry=%s remaining=%s source=%s", registryDomain, remainingPath, registryRouteSource(c, pathWithoutV2, registryDomain))
 
 			handleMultiRegistryRequest(c, registryDomain, remainingPath)
 			return
@@ -118,6 +139,7 @@ func handleRegistryRequest(c *gin.Context, path string) {
 
 	imageName, apiType, reference := parseRegistryPath(pathWithoutV2)
 	if imageName == "" || apiType == "" {
+		logDockerProxy(c, "event=invalid_registry_path raw_path=%s status=400", pathWithoutV2)
 		c.String(http.StatusBadRequest, "Invalid path format")
 		return
 	}
@@ -128,6 +150,7 @@ func handleRegistryRequest(c *gin.Context, path string) {
 
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(imageName); !allowed {
 		fmt.Printf("Docker镜像 %s 访问被拒绝: %s\n", imageName, reason)
+		logDockerProxy(c, "event=access_denied image=%s reason=%s status=403", imageName, reason)
 		c.String(http.StatusForbidden, "镜像访问被限制")
 		return
 	}
@@ -136,14 +159,28 @@ func handleRegistryRequest(c *gin.Context, path string) {
 
 	switch apiType {
 	case "manifests":
+		logDockerProxy(c, "event=dockerhub_manifest image=%s reference=%s has_auth=%t", imageRef, reference, hasAuthorization(c))
 		handleManifestRequest(c, imageRef, reference)
 	case "blobs":
+		logDockerProxy(c, "event=dockerhub_blob image=%s digest=%s has_auth=%t", imageRef, reference, hasAuthorization(c))
 		handleBlobRequest(c, imageRef, reference)
 	case "tags":
+		logDockerProxy(c, "event=dockerhub_tags image=%s has_auth=%t", imageRef, hasAuthorization(c))
 		handleTagsRequest(c, imageRef)
 	default:
+		logDockerProxy(c, "event=unknown_api api=%s image=%s status=404", apiType, imageName)
 		c.String(http.StatusNotFound, "API endpoint not found")
 	}
+}
+
+func registryRouteSource(c *gin.Context, path, registryDomain string) string {
+	if c.Query("ns") == registryDomain {
+		return "containerd_ns"
+	}
+	if strings.HasPrefix(path, registryDomain+"/") {
+		return "path_prefix"
+	}
+	return "unknown"
 }
 
 // parseRegistryPath 解析Registry路径
@@ -194,6 +231,7 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 
 	if err != nil {
 		fmt.Printf("解析镜像引用失败: %v\n", err)
+		logDockerProxy(c, "event=manifest_parse_error image=%s reference=%s error=%q status=400", imageRef, reference, err)
 		c.String(http.StatusBadRequest, "Invalid reference")
 		return
 	}
@@ -202,10 +240,12 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 		desc, err := remote.Head(ref, dockerProxy.options...)
 		if err != nil {
 			fmt.Printf("HEAD请求失败: %v\n", err)
+			logDockerProxy(c, "event=dockerhub_manifest_head_error image=%s reference=%s error=%q status=404", imageRef, reference, err)
 			c.String(http.StatusNotFound, "Manifest not found")
 			return
 		}
 
+		logDockerProxy(c, "event=dockerhub_manifest_head_ok image=%s reference=%s digest=%s media_type=%s size=%d status=200", imageRef, reference, desc.Digest.String(), desc.MediaType, desc.Size)
 		c.Header("Content-Type", string(desc.MediaType))
 		c.Header("Docker-Content-Digest", desc.Digest.String())
 		c.Header("Content-Length", fmt.Sprintf("%d", desc.Size))
@@ -214,6 +254,7 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 		desc, err := remote.Get(ref, dockerProxy.options...)
 		if err != nil {
 			fmt.Printf("GET请求失败: %v\n", err)
+			logDockerProxy(c, "event=dockerhub_manifest_get_error image=%s reference=%s error=%q status=404", imageRef, reference, err)
 			c.String(http.StatusNotFound, "Manifest not found")
 			return
 		}
@@ -227,8 +268,10 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 			cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
 			ttl := utils.GetManifestTTL(reference)
 			utils.GlobalCache.Set(cacheKey, desc.Manifest, string(desc.MediaType), headers, ttl)
+			logDockerProxy(c, "event=manifest_cache_store image=%s reference=%s ttl=%s", imageRef, reference, ttl)
 		}
 
+		logDockerProxy(c, "event=dockerhub_manifest_get_ok image=%s reference=%s digest=%s media_type=%s bytes=%d status=200", imageRef, reference, desc.Digest.String(), desc.MediaType, len(desc.Manifest))
 		c.Header("Content-Type", string(desc.MediaType))
 		for key, value := range headers {
 			c.Header(key, value)
@@ -243,6 +286,7 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
 	if err != nil {
 		fmt.Printf("解析digest引用失败: %v\n", err)
+		logDockerProxy(c, "event=blob_parse_error image=%s digest=%s error=%q status=400", imageRef, digest, err)
 		c.String(http.StatusBadRequest, "Invalid digest reference")
 		return
 	}
@@ -250,6 +294,7 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	layer, err := remote.Layer(digestRef, dockerProxy.options...)
 	if err != nil {
 		fmt.Printf("获取layer失败: %v\n", err)
+		logDockerProxy(c, "event=dockerhub_blob_layer_error image=%s digest=%s error=%q status=404", imageRef, digest, err)
 		c.String(http.StatusNotFound, "Layer not found")
 		return
 	}
@@ -257,6 +302,7 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	size, err := layer.Size()
 	if err != nil {
 		fmt.Printf("获取layer大小失败: %v\n", err)
+		logDockerProxy(c, "event=dockerhub_blob_size_error image=%s digest=%s error=%q status=500", imageRef, digest, err)
 		c.String(http.StatusInternalServerError, "Failed to get layer size")
 		return
 	}
@@ -264,11 +310,13 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	reader, err := layer.Compressed()
 	if err != nil {
 		fmt.Printf("获取layer内容失败: %v\n", err)
+		logDockerProxy(c, "event=dockerhub_blob_reader_error image=%s digest=%s error=%q status=500", imageRef, digest, err)
 		c.String(http.StatusInternalServerError, "Failed to get layer content")
 		return
 	}
 	defer reader.Close()
 
+	logDockerProxy(c, "event=dockerhub_blob_stream_start image=%s digest=%s size=%d status=200", imageRef, digest, size)
 	c.Header("Content-Type", "application/octet-stream")
 	c.Header("Content-Length", fmt.Sprintf("%d", size))
 	c.Header("Docker-Content-Digest", digest)
@@ -276,6 +324,9 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	c.Status(http.StatusOK)
 	if _, err := io.Copy(c.Writer, reader); err != nil {
 		fmt.Printf("复制layer内容失败: %v\n", err)
+		logDockerProxy(c, "event=dockerhub_blob_stream_error image=%s digest=%s error=%q", imageRef, digest, err)
+	} else {
+		logDockerProxy(c, "event=dockerhub_blob_stream_complete image=%s digest=%s size=%d", imageRef, digest, size)
 	}
 }
 
@@ -284,6 +335,7 @@ func handleTagsRequest(c *gin.Context, imageRef string) {
 	repo, err := name.NewRepository(imageRef)
 	if err != nil {
 		fmt.Printf("解析repository失败: %v\n", err)
+		logDockerProxy(c, "event=tags_parse_error image=%s error=%q status=400", imageRef, err)
 		c.String(http.StatusBadRequest, "Invalid repository")
 		return
 	}
@@ -291,10 +343,12 @@ func handleTagsRequest(c *gin.Context, imageRef string) {
 	tags, err := remote.List(repo, dockerProxy.options...)
 	if err != nil {
 		fmt.Printf("获取tags失败: %v\n", err)
+		logDockerProxy(c, "event=dockerhub_tags_error image=%s error=%q status=404", imageRef, err)
 		c.String(http.StatusNotFound, "Tags not found")
 		return
 	}
 
+	logDockerProxy(c, "event=dockerhub_tags_ok image=%s count=%d status=200", imageRef, len(tags))
 	response := map[string]interface{}{
 		"name": strings.TrimPrefix(imageRef, dockerProxy.registry.Name()+"/"),
 		"tags": tags,
@@ -305,6 +359,7 @@ func handleTagsRequest(c *gin.Context, imageRef string) {
 
 // ProxyDockerAuthGin Docker认证代理
 func ProxyDockerAuthGin(c *gin.Context) {
+	logDockerProxy(c, "event=auth_proxy_start service=%s scope=%s has_auth=%t cache_enabled=%t", c.Query("service"), c.Query("scope"), hasAuthorization(c), utils.IsTokenCacheEnabled())
 	if utils.IsTokenCacheEnabled() {
 		proxyDockerAuthWithCache(c)
 	} else {
@@ -314,7 +369,8 @@ func ProxyDockerAuthGin(c *gin.Context) {
 
 // proxyDockerAuthWithCache 带缓存的认证代理
 func proxyDockerAuthWithCache(c *gin.Context) {
-	if strings.TrimSpace(c.GetHeader("Authorization")) != "" {
+	if hasAuthorization(c) {
+		logDockerProxy(c, "event=token_cache_bypass reason=credentialed_request service=%s scope=%s", c.Query("service"), c.Query("scope"))
 		proxyDockerAuthOriginal(c)
 		return
 	}
@@ -322,9 +378,11 @@ func proxyDockerAuthWithCache(c *gin.Context) {
 	cacheKey := utils.BuildTokenCacheKey(c.Request.URL.RawQuery)
 
 	if cachedToken := utils.GlobalCache.GetToken(cacheKey); cachedToken != "" {
+		logDockerProxy(c, "event=token_cache_hit key=%s service=%s scope=%s", cacheKey, c.Query("service"), c.Query("scope"))
 		utils.WriteTokenResponse(c, cachedToken)
 		return
 	}
+	logDockerProxy(c, "event=token_cache_miss key=%s service=%s scope=%s", cacheKey, c.Query("service"), c.Query("scope"))
 
 	recorder := &ResponseRecorder{
 		ResponseWriter: c.Writer,
@@ -337,6 +395,7 @@ func proxyDockerAuthWithCache(c *gin.Context) {
 	if recorder.statusCode == 200 && len(recorder.body) > 0 {
 		ttl := utils.ExtractTTLFromResponse(recorder.body)
 		utils.GlobalCache.SetToken(cacheKey, string(recorder.body), ttl)
+		logDockerProxy(c, "event=token_cache_store key=%s ttl=%s service=%s scope=%s", cacheKey, ttl, c.Query("service"), c.Query("scope"))
 	}
 
 	c.Writer = recorder.ResponseWriter
@@ -362,6 +421,7 @@ func (r *ResponseRecorder) Write(data []byte) (int, error) {
 func proxyDockerAuthOriginal(c *gin.Context) {
 	authURL, err := buildDockerAuthURL(c)
 	if err != nil {
+		logDockerProxy(c, "event=auth_proxy_reject service=%s scope=%s has_auth=%t error=%q status=400", c.Query("service"), c.Query("scope"), hasAuthorization(c), err)
 		c.String(http.StatusBadRequest, err.Error())
 		return
 	}
@@ -378,14 +438,17 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 		c.Request.Body,
 	)
 	if err != nil {
+		logDockerProxy(c, "event=auth_request_create_error target=%s error=%q status=500", authURL, err)
 		c.String(http.StatusInternalServerError, "Failed to create request")
 		return
 	}
 
 	copyProxyRequestHeaders(req.Header, c.Request.Header)
+	logDockerProxy(c, "event=auth_upstream_request target=%s service=%s scope=%s has_auth=%t", authURL, c.Query("service"), c.Query("scope"), hasAuthorization(c))
 
 	resp, err := client.Do(req)
 	if err != nil {
+		logDockerProxy(c, "event=auth_upstream_error target=%s error=%q status=502", authURL, err)
 		c.String(http.StatusBadGateway, "Auth request failed")
 		return
 	}
@@ -406,19 +469,22 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 		}
 	}
 
+	logDockerProxy(c, "event=auth_upstream_response target=%s upstream_status=%d challenge=%t content_type=%s", authURL, resp.StatusCode, resp.Header.Get("WWW-Authenticate") != "", resp.Header.Get("Content-Type"))
 	c.Status(resp.StatusCode)
 	if _, err := io.Copy(c.Writer, resp.Body); err != nil {
 		fmt.Printf("复制认证响应失败: %v\n", err)
+		logDockerProxy(c, "event=auth_response_copy_error target=%s error=%q", authURL, err)
 	}
 }
 
 func buildDockerAuthURL(c *gin.Context) (string, error) {
 	if mapping, found := detectAuthRegistryMapping(c); found {
+		logDockerProxy(c, "event=auth_mapping_selected service=%s auth_host=%s upstream=%s auth_type=%s", c.Query("service"), mapping.AuthHost, mapping.Upstream, mapping.AuthType)
 		return buildMappedAuthURL(c, mapping), nil
 	}
 
 	service := strings.TrimSpace(c.Query("service"))
-	if strings.TrimSpace(c.GetHeader("Authorization")) != "" && !isDockerHubAuthService(service) {
+	if hasAuthorization(c) && !isDockerHubAuthService(service) {
 		return "", fmt.Errorf("unsupported auth service %q", service)
 	}
 
@@ -598,12 +664,14 @@ func requestScheme(c *gin.Context) string {
 func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath string) {
 	mapping, exists := registryDetector.getRegistryMapping(registryDomain)
 	if !exists {
+		logDockerProxy(c, "event=registry_mapping_missing registry=%s status=400", registryDomain)
 		c.String(http.StatusBadRequest, "Registry not configured")
 		return
 	}
 
 	imageName, apiType, _ := parseRegistryPath(remainingPath)
 	if imageName == "" || apiType == "" {
+		logDockerProxy(c, "event=multi_registry_invalid_path registry=%s remaining=%s status=400", registryDomain, remainingPath)
 		c.String(http.StatusBadRequest, "Invalid path format")
 		return
 	}
@@ -611,6 +679,7 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 	fullImageName := registryDomain + "/" + imageName
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(fullImageName); !allowed {
 		fmt.Printf("镜像 %s 访问被拒绝: %s\n", fullImageName, reason)
+		logDockerProxy(c, "event=multi_registry_access_denied registry=%s image=%s reason=%s status=403", registryDomain, fullImageName, reason)
 		c.String(http.StatusForbidden, "镜像访问被限制")
 		return
 	}
@@ -620,12 +689,15 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 	case "blobs":
 	case "tags":
 	default:
+		logDockerProxy(c, "event=multi_registry_unknown_api registry=%s api=%s image=%s status=404", registryDomain, apiType, fullImageName)
 		c.String(http.StatusNotFound, "API endpoint not found")
 		return
 	}
 
+	logDockerProxy(c, "event=multi_registry_proxy_start registry=%s upstream=%s auth_type=%s image=%s api=%s has_auth=%t", registryDomain, mapping.Upstream, mapping.AuthType, fullImageName, apiType, hasAuthorization(c))
 	if err := proxyUpstreamRegistryRequest(c, mapping, remainingPath); err != nil {
 		fmt.Printf("代理上游Registry失败: %v\n", err)
+		logDockerProxy(c, "event=multi_registry_proxy_error registry=%s image=%s api=%s error=%q status=502", registryDomain, fullImageName, apiType, err)
 		c.String(http.StatusBadGateway, "Upstream registry request failed")
 		return
 	}
@@ -636,18 +708,21 @@ func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping
 	if err != nil {
 		return err
 	}
+	nsWasPresent := c.Request.URL.Query().Get("ns") != ""
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, upstreamURL, c.Request.Body)
 	if err != nil {
 		return err
 	}
 	copyProxyRequestHeaders(req.Header, c.Request.Header)
+	logDockerProxy(c, "event=upstream_registry_request target=%s ns_stripped=%t has_auth=%t accept=%q", upstreamURL, nsWasPresent, hasAuthorization(c), c.GetHeader("Accept"))
 
 	resp, err := utils.GetGlobalHTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	logDockerProxy(c, "event=upstream_registry_response target=%s upstream_status=%d challenge=%t digest=%s content_type=%s content_length=%s", upstreamURL, resp.StatusCode, resp.Header.Get("WWW-Authenticate") != "", resp.Header.Get("Docker-Content-Digest"), resp.Header.Get("Content-Type"), resp.Header.Get("Content-Length"))
 
 	proxyBaseURL := getProxyBaseURL(c)
 	connectionHeaders := connectionHeaderNames(resp.Header)
@@ -665,11 +740,15 @@ func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping
 
 	c.Status(resp.StatusCode)
 	if c.Request.Method == http.MethodHead {
+		logDockerProxy(c, "event=upstream_registry_head_complete target=%s status=%d", upstreamURL, resp.StatusCode)
 		return nil
 	}
 
 	if _, err = io.Copy(c.Writer, resp.Body); err != nil {
 		fmt.Printf("复制上游Registry响应失败: %v\n", err)
+		logDockerProxy(c, "event=upstream_registry_stream_error target=%s status=%d error=%q", upstreamURL, resp.StatusCode, err)
+	} else {
+		logDockerProxy(c, "event=upstream_registry_stream_complete target=%s status=%d", upstreamURL, resp.StatusCode)
 	}
 	return nil
 }

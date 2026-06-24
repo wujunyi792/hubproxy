@@ -1,9 +1,0 @@
-/var/log/hubproxy.log {
-    weekly
-    maxsize 50M
-    rotate 4
-    compress
-    missingok
-    notifempty
-    copytruncate
-}
