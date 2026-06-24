@@ -1,12 +1,20 @@
 services:
   hubproxy:
-    image: ghcr.io/sky22333/hubproxy
+    image: ghcr.io/wujunyi792/hubproxy:latest
     container_name: hubproxy
     restart: always
     ports:
       - "5000:5000"
+    environment:
+      CONFIG_PATH: /app/config.toml
     volumes:
       - ./src/config.toml:/app/config.toml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5000/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     logging:
       driver: json-file
       options:

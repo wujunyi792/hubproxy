@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="${REPO:-sky22333/hubproxy}"
+REPO="${REPO:-wujunyi792/hubproxy}"
 VERSION="${VERSION:-latest}"
 TMP_DIR="${TMP_DIR:-/tmp/hubproxy-install}"
 

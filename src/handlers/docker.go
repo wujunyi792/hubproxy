@@ -1,10 +1,10 @@
 package handlers
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -314,6 +314,11 @@ func ProxyDockerAuthGin(c *gin.Context) {
 
 // proxyDockerAuthWithCache 带缓存的认证代理
 func proxyDockerAuthWithCache(c *gin.Context) {
+	if strings.TrimSpace(c.GetHeader("Authorization")) != "" {
+		proxyDockerAuthOriginal(c)
+		return
+	}
+
 	cacheKey := utils.BuildTokenCacheKey(c.Request.URL.RawQuery)
 
 	if cachedToken := utils.GlobalCache.GetToken(cacheKey); cachedToken != "" {
@@ -355,19 +360,10 @@ func (r *ResponseRecorder) Write(data []byte) (int, error) {
 }
 
 func proxyDockerAuthOriginal(c *gin.Context) {
-	var authURL string
-	if targetDomain, exists := c.Get("target_registry_domain"); exists {
-		if mapping, found := registryDetector.getRegistryMapping(targetDomain.(string)); found {
-			authURL = "https://" + mapping.AuthHost + c.Request.URL.Path
-		} else {
-			authURL = "https://auth.docker.io" + c.Request.URL.Path
-		}
-	} else {
-		authURL = "https://auth.docker.io" + c.Request.URL.Path
-	}
-
-	if c.Request.URL.RawQuery != "" {
-		authURL += "?" + c.Request.URL.RawQuery
+	authURL, err := buildDockerAuthURL(c)
+	if err != nil {
+		c.String(http.StatusBadRequest, err.Error())
+		return
 	}
 
 	client := &http.Client{
@@ -376,7 +372,7 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 	}
 
 	req, err := http.NewRequestWithContext(
-		context.Background(),
+		c.Request.Context(),
 		c.Request.Method,
 		authURL,
 		c.Request.Body,
@@ -386,11 +382,7 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 		return
 	}
 
-	for key, values := range c.Request.Header {
-		for _, value := range values {
-			req.Header.Add(key, value)
-		}
-	}
+	copyProxyRequestHeaders(req.Header, c.Request.Header)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -399,21 +391,18 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	proxyHost := c.Request.Host
-	if proxyHost == "" {
-		cfg := config.GetConfig()
-		proxyHost = fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
-		if cfg.Server.Host == "0.0.0.0" {
-			proxyHost = fmt.Sprintf("localhost:%d", cfg.Server.Port)
-		}
-	}
+	proxyBaseURL := getProxyBaseURL(c)
 
+	connectionHeaders := connectionHeaderNames(resp.Header)
 	for key, values := range resp.Header {
 		for _, value := range values {
-			if key == "Www-Authenticate" {
-				value = rewriteAuthHeader(value, proxyHost)
+			if shouldSkipProxyHeader(key, connectionHeaders) {
+				continue
 			}
-			c.Header(key, value)
+			if strings.EqualFold(key, "WWW-Authenticate") {
+				value = rewriteAuthHeader(value, proxyBaseURL)
+			}
+			c.Writer.Header().Add(key, value)
 		}
 	}
 
@@ -423,14 +412,186 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 	}
 }
 
-// rewriteAuthHeader 重写认证头
-func rewriteAuthHeader(authHeader, proxyHost string) string {
-	authHeader = strings.ReplaceAll(authHeader, "https://auth.docker.io", "http://"+proxyHost)
-	authHeader = strings.ReplaceAll(authHeader, "https://ghcr.io", "http://"+proxyHost)
-	authHeader = strings.ReplaceAll(authHeader, "https://gcr.io", "http://"+proxyHost)
-	authHeader = strings.ReplaceAll(authHeader, "https://quay.io", "http://"+proxyHost)
+func buildDockerAuthURL(c *gin.Context) (string, error) {
+	if mapping, found := detectAuthRegistryMapping(c); found {
+		return buildMappedAuthURL(c, mapping), nil
+	}
 
-	return authHeader
+	service := strings.TrimSpace(c.Query("service"))
+	if strings.TrimSpace(c.GetHeader("Authorization")) != "" && !isDockerHubAuthService(service) {
+		return "", fmt.Errorf("unsupported auth service %q", service)
+	}
+
+	authURL := "https://auth.docker.io" + c.Request.URL.Path
+	if c.Request.URL.RawQuery != "" {
+		authURL += "?" + c.Request.URL.RawQuery
+	}
+	return authURL, nil
+}
+
+func detectAuthRegistryMapping(c *gin.Context) (config.RegistryMapping, bool) {
+	if targetDomain, exists := c.Get("target_registry_domain"); exists {
+		if mapping, found := registryDetector.getRegistryMapping(targetDomain.(string)); found {
+			return mapping, true
+		}
+	}
+
+	cfg := config.GetConfig()
+	for _, candidate := range []string{c.Query("service"), c.Query("ns")} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if mapping, exists := cfg.Registries[candidate]; exists && mapping.Enabled {
+			return mapping, true
+		}
+		for _, mapping := range cfg.Registries {
+			if mapping.Enabled && normalizeRegistryHost(mapping.Upstream) == candidate {
+				return mapping, true
+			}
+		}
+	}
+
+	return config.RegistryMapping{}, false
+}
+
+func buildMappedAuthURL(c *gin.Context, mapping config.RegistryMapping) string {
+	rawAuthHost := strings.TrimSpace(mapping.AuthHost)
+	if rawAuthHost == "" {
+		rawAuthHost = strings.TrimSpace(mapping.Upstream)
+	}
+	if !strings.Contains(rawAuthHost, "://") {
+		rawAuthHost = "https://" + rawAuthHost
+	}
+
+	parsed, err := url.Parse(rawAuthHost)
+	if err != nil || parsed.Host == "" {
+		return "https://auth.docker.io" + c.Request.URL.RequestURI()
+	}
+	if parsed.Path == "" || parsed.Path == "/" {
+		parsed.Path = c.Request.URL.Path
+	}
+	parsed.RawQuery = c.Request.URL.RawQuery
+
+	return parsed.String()
+}
+
+func isDockerHubAuthService(service string) bool {
+	switch service {
+	case "registry.docker.io", "auth.docker.io", "index.docker.io", "docker.io":
+		return true
+	default:
+		return false
+	}
+}
+
+// rewriteAuthHeader 重写认证头
+func rewriteAuthHeader(authHeader, proxyBaseURL string) string {
+	bearerStart := findBearerChallengeStart(authHeader)
+	if bearerStart == -1 {
+		return authHeader
+	}
+
+	return authHeader[:bearerStart] + rewriteAuthRealm(authHeader[bearerStart:], proxyBaseURL)
+}
+
+func findBearerChallengeStart(authHeader string) int {
+	inQuote := false
+	for i := 0; i < len(authHeader); i++ {
+		switch authHeader[i] {
+		case '"':
+			inQuote = !inQuote
+		case ',':
+			if inQuote {
+				continue
+			}
+			next := strings.TrimLeft(authHeader[i+1:], " \t")
+			if len(next) >= len("Bearer ") && strings.EqualFold(next[:len("Bearer")], "Bearer") && (next[len("Bearer")] == ' ' || next[len("Bearer")] == '\t') {
+				return i + 1 + len(authHeader[i+1:]) - len(next)
+			}
+		}
+	}
+
+	trimmed := strings.TrimLeft(authHeader, " \t")
+	if len(trimmed) >= len("Bearer ") && strings.EqualFold(trimmed[:len("Bearer")], "Bearer") && (trimmed[len("Bearer")] == ' ' || trimmed[len("Bearer")] == '\t') {
+		return len(authHeader) - len(trimmed)
+	}
+	return -1
+}
+
+func rewriteAuthRealm(authHeader, proxyBaseURL string) string {
+	realm := strings.TrimRight(proxyBaseURL, "/") + "/token"
+	lower := strings.ToLower(authHeader)
+	idx := strings.Index(lower, "realm=")
+	if idx == -1 {
+		return authHeader
+	}
+
+	valueStart := idx + len("realm=")
+	if valueStart >= len(authHeader) {
+		return authHeader
+	}
+
+	if authHeader[valueStart] == '"' {
+		valueEnd := strings.Index(authHeader[valueStart+1:], "\"")
+		if valueEnd == -1 {
+			return authHeader
+		}
+		valueEnd += valueStart + 1
+		return authHeader[:valueStart+1] + realm + authHeader[valueEnd:]
+	}
+
+	valueEnd := strings.Index(authHeader[valueStart:], ",")
+	if valueEnd == -1 {
+		return authHeader[:valueStart] + `"` + realm + `"`
+	}
+	valueEnd += valueStart
+	return authHeader[:valueStart] + `"` + realm + `"` + authHeader[valueEnd:]
+}
+
+func getProxyBaseURL(c *gin.Context) string {
+	proxyHost := c.Request.Host
+	if proxyHost == "" {
+		cfg := config.GetConfig()
+		proxyHost = fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
+		if cfg.Server.Host == "0.0.0.0" {
+			proxyHost = fmt.Sprintf("localhost:%d", cfg.Server.Port)
+		}
+	}
+
+	return requestScheme(c) + "://" + proxyHost
+}
+
+func requestScheme(c *gin.Context) string {
+	if proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); proto != "" {
+		if idx := strings.Index(proto, ","); idx != -1 {
+			proto = strings.TrimSpace(proto[:idx])
+		}
+		if proto == "http" || proto == "https" {
+			return proto
+		}
+	}
+
+	if forwarded := c.GetHeader("Forwarded"); forwarded != "" {
+		for _, element := range strings.Split(forwarded, ",") {
+			for _, part := range strings.Split(element, ";") {
+				part = strings.TrimSpace(part)
+				key, value, ok := strings.Cut(part, "=")
+				if !ok || !strings.EqualFold(key, "proto") {
+					continue
+				}
+				value = strings.Trim(value, `"`)
+				if value == "http" || value == "https" {
+					return value
+				}
+			}
+		}
+	}
+
+	if c.Request.TLS != nil {
+		return "https"
+	}
+	return "http"
 }
 
 // handleMultiRegistryRequest 处理多Registry请求
@@ -441,7 +602,7 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 		return
 	}
 
-	imageName, apiType, reference := parseRegistryPath(remainingPath)
+	imageName, apiType, _ := parseRegistryPath(remainingPath)
 	if imageName == "" || apiType == "" {
 		c.String(http.StatusBadRequest, "Invalid path format")
 		return
@@ -454,18 +615,146 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 		return
 	}
 
-	upstreamImageRef := fmt.Sprintf("%s/%s", mapping.Upstream, imageName)
-
 	switch apiType {
 	case "manifests":
-		handleUpstreamManifestRequest(c, upstreamImageRef, reference, mapping)
 	case "blobs":
-		handleUpstreamBlobRequest(c, upstreamImageRef, reference, mapping)
 	case "tags":
-		handleUpstreamTagsRequest(c, upstreamImageRef, mapping)
 	default:
 		c.String(http.StatusNotFound, "API endpoint not found")
+		return
 	}
+
+	if err := proxyUpstreamRegistryRequest(c, mapping, remainingPath); err != nil {
+		fmt.Printf("代理上游Registry失败: %v\n", err)
+		c.String(http.StatusBadGateway, "Upstream registry request failed")
+		return
+	}
+}
+
+func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping, remainingPath string) error {
+	upstreamURL, err := buildUpstreamRegistryURL(c, mapping, remainingPath)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, upstreamURL, c.Request.Body)
+	if err != nil {
+		return err
+	}
+	copyProxyRequestHeaders(req.Header, c.Request.Header)
+
+	resp, err := utils.GetGlobalHTTPClient().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	proxyBaseURL := getProxyBaseURL(c)
+	connectionHeaders := connectionHeaderNames(resp.Header)
+	for key, values := range resp.Header {
+		if shouldSkipProxyHeader(key, connectionHeaders) {
+			continue
+		}
+		for _, value := range values {
+			if strings.EqualFold(key, "WWW-Authenticate") {
+				value = rewriteAuthHeader(value, proxyBaseURL)
+			}
+			c.Writer.Header().Add(key, value)
+		}
+	}
+
+	c.Status(resp.StatusCode)
+	if c.Request.Method == http.MethodHead {
+		return nil
+	}
+
+	if _, err = io.Copy(c.Writer, resp.Body); err != nil {
+		fmt.Printf("复制上游Registry响应失败: %v\n", err)
+	}
+	return nil
+}
+
+func buildUpstreamRegistryURL(c *gin.Context, mapping config.RegistryMapping, remainingPath string) (string, error) {
+	rawUpstream := strings.TrimSpace(mapping.Upstream)
+	if rawUpstream == "" {
+		return "", fmt.Errorf("empty upstream registry")
+	}
+	if !strings.Contains(rawUpstream, "://") {
+		rawUpstream = "https://" + rawUpstream
+	}
+
+	parsed, err := url.Parse(rawUpstream)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("invalid upstream registry %q", mapping.Upstream)
+	}
+
+	basePath := strings.TrimRight(parsed.Path, "/")
+	parsed.Path = basePath + "/v2/" + strings.TrimLeft(remainingPath, "/")
+	query := c.Request.URL.Query()
+	query.Del("ns")
+	parsed.RawQuery = query.Encode()
+
+	return parsed.String(), nil
+}
+
+func copyProxyRequestHeaders(dst, src http.Header) {
+	connectionHeaders := connectionHeaderNames(src)
+	for key, values := range src {
+		if shouldSkipProxyHeader(key, connectionHeaders) {
+			continue
+		}
+		for _, value := range values {
+			dst.Add(key, value)
+		}
+	}
+}
+
+func shouldSkipProxyHeader(header string, connectionHeaders map[string]struct{}) bool {
+	if isHopByHopHeader(header) {
+		return true
+	}
+	_, ok := connectionHeaders[strings.ToLower(header)]
+	return ok
+}
+
+func isHopByHopHeader(header string) bool {
+	switch strings.ToLower(header) {
+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade":
+		return true
+	default:
+		return false
+	}
+}
+
+func connectionHeaderNames(headers http.Header) map[string]struct{} {
+	names := make(map[string]struct{})
+	for _, value := range headers.Values("Connection") {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.ToLower(strings.TrimSpace(name))
+			if name != "" {
+				names[name] = struct{}{}
+			}
+		}
+	}
+	return names
+}
+
+func normalizeRegistryHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return parsed.Host
 }
 
 // handleUpstreamManifestRequest 处理上游Registry的manifest请求

@@ -6,7 +6,7 @@
 
 
 <p align="center">
-  <img src="https://count.getloli.com/get/@sky22333.hubproxy?theme=rule34" alt="Visitors">
+  <img src="https://count.getloli.com/get/@wujunyi792.hubproxy?theme=rule34" alt="Visitors">
 </p>
 
 ## 特性
@@ -25,9 +25,9 @@
 
 ## 详细文档
 
-[中文文档](https://zread.ai/sky22333/hubproxy)
+[中文文档](https://zread.ai/wujunyi792/hubproxy)
 
-[English](https://deepwiki.com/sky22333/hubproxy)
+[English](https://deepwiki.com/wujunyi792/hubproxy)
 
 ## 快速开始
 
@@ -37,7 +37,7 @@ docker run -d \
   --name hubproxy \
   -p 5000:5000 \
   --restart always \
-  ghcr.io/sky22333/hubproxy
+  ghcr.io/wujunyi792/hubproxy
 ```
 
 ### 脚本安装
@@ -45,7 +45,7 @@ docker run -d \
 自动识别系统与架构，从 GitHub Releases 下载对应的 `.deb`、`.rpm` 或 `.apk` 安装包：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sky22333/hubproxy/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/wujunyi792/hubproxy/main/install.sh | sh
 ```
 
 安装包会自动安装并启动 `hubproxy` 服务。
@@ -117,7 +117,7 @@ docker pull nginx
 docker pull yourdomain.com/nginx
 
 # ghcr加速
-docker pull yourdomain.com/ghcr.io/sky22333/hubproxy
+docker pull yourdomain.com/ghcr.io/wujunyi792/hubproxy
 
 # 符合Docker Registry API v2标准的仓库都支持
 ```
@@ -146,7 +146,7 @@ https://github.com/user/repo/releases/download/v1.0.0/file.tar.gz
 https://yourdomain.com/https://github.com/user/repo/releases/download/v1.0.0/file.tar.gz
 
 # 加速下载仓库
-git clone https://yourdomain.com/https://github.com/sky22333/hubproxy.git
+git clone https://yourdomain.com/https://github.com/wujunyi792/hubproxy.git
 ```
 
 ## 配置
@@ -295,7 +295,7 @@ example.com {
 }
 ```
 
-> 对于使用nginx反代的用户，Github加速提示`无效输入`的问题可以参见[issues/62](https://github.com/sky22333/hubproxy/issues/62#issuecomment-3219572440)
+> 对于使用nginx反代的用户，Github加速提示`无效输入`的问题可以参见[issues/62](https://github.com/wujunyi792/hubproxy/issues/62#issuecomment-3219572440)
 
 
 ## ⚠️ 免责声明
@@ -317,4 +317,4 @@ example.com {
 ![1](./.github/demo/demo1.jpg)
 
 ## Star 趋势
-[![Star 趋势](https://starchart.cc/sky22333/hubproxy.svg?variant=adaptive)](https://starchart.cc/sky22333/hubproxy)
+[![Star 趋势](https://starchart.cc/wujunyi792/hubproxy.svg?variant=adaptive)](https://starchart.cc/wujunyi792/hubproxy)

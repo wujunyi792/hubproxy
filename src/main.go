@@ -114,7 +114,7 @@ func main() {
 		fmt.Printf("H2c: 已启用\n")
 	}
 	fmt.Printf("版本号: %s\n", Version)
-	fmt.Printf("项目地址: https://github.com/sky22333/hubproxy\n")
+	fmt.Printf("项目地址: https://github.com/wujunyi792/hubproxy\n")
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
