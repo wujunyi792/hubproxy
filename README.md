@@ -42,27 +42,49 @@ docker run -d \
 
 ### Docker Compose
 
-仓库内置 `docker-compose.yml`，默认使用 `ghcr.io/wujunyi792/hubproxy:latest`，并挂载 `src/config.toml`：
+仓库内置 `docker-compose.yml` 和 `Makefile`，默认使用 `ghcr.io/wujunyi792/hubproxy:latest`。
+
+首次部署会从 `config.example.toml` 生成本地运行配置 `config.toml`。`config.toml` 已被 Git 忽略，后续在服务器上修改配置不会影响 `git pull`。
+
+Registry 的 upstream endpoint、token endpoint 和鉴权 service alias 已内置在代码中，配置文件只保留启停开关。目前鉴权透传覆盖 `ghcr.io`、`docker.io`、`quay.io`、`docker.elastic.co`、`nvcr.io` 和 `gcr.io`；`mcr.microsoft.com`、`registry.k8s.io` 作为公开匿名 registry 走普通代理转发。
 
 ```bash
-docker compose up -d
+make up
 ```
 
 ```bash
 # 查看状态
-docker compose ps
+make ps
 
 # 重启服务
-docker compose restart hubproxy
+make restart
+
+# 修改 config.toml 后应用配置
+make reload
 
 # 查看实时日志
-docker compose logs -f hubproxy
+make logs
+
+# 拉取代码和镜像并重建服务
+make update
 ```
 
 ### 文件路径
 
 - Docker Compose 配置文件：`docker-compose.yml`
-- HubProxy 配置文件：`src/config.toml`，容器内路径为 `/app/config.toml`
+- 运维命令入口：`Makefile`
+- Compose 环境变量样例：`.env.example`，Git 跟踪；本地 `.env`，Git 忽略
+- 示例配置文件：`config.example.toml`，Git 跟踪
+- 本地运行配置：`config.toml`，Git 忽略，容器内路径为 `/app/config.toml`
+- 镜像内置默认配置：构建时由 `config.example.toml` 复制到 `/app/config.toml`
+
+如果需要固定镜像版本或修改宿主机端口，可以用环境变量覆盖，也可以复制 `.env.example` 为 `.env` 后长期保留在服务器上：
+
+```bash
+HUBPROXY_IMAGE=ghcr.io/wujunyi792/hubproxy:0.1.1 HUBPROXY_PORT=5000 make up
+```
+
+Docker Compose 会强制容器内 HubProxy 监听 `5000`，宿主机端口请改 `HUBPROXY_PORT`，不要通过 `config.toml` 的 `server.port` 改容器内端口。
 
 ## 使用方法
 
@@ -78,7 +100,7 @@ docker pull yourdomain.com/nginx
 # ghcr加速
 docker pull yourdomain.com/ghcr.io/wujunyi792/hubproxy
 
-# 符合Docker Registry API v2标准的仓库都支持
+# 多 Registry 代理支持内置清单中的仓库；不支持在配置中自定义任意 endpoint
 ```
 
 当然也支持配置为全局镜像加速，在主机上新建（或编辑）`/etc/docker/daemon.json`
@@ -136,18 +158,11 @@ periodHours = 3.0
 [security]
 # IP白名单，支持单个IP或IP段
 # 白名单中的IP不受限流限制
-whiteList = [
-    "127.0.0.1",
-    "172.17.0.0/16",
-    "192.168.1.0/24"
-]
+whiteList = []
 
 # IP黑名单，支持单个IP或IP段
 # 黑名单中的IP将被直接拒绝访问
-blackList = [
-    "192.168.100.1",
-    "192.168.100.0/24"
-]
+blackList = []
 
 [access]
 # 代理服务白名单（支持GitHub仓库和Docker镜像，支持通配符）
@@ -156,11 +171,7 @@ whiteList = []
 
 # 代理服务黑名单（支持GitHub仓库和Docker镜像，支持通配符）
 # 禁止访问黑名单中的仓库/镜像
-blackList = [
-    "baduser/malicious-repo",
-    "*/malicious-repo",
-    "baduser/*"
-]
+blackList = []
 
 # 代理配置，支持有用户名/密码认证和无认证模式
 # 无认证: socks5://127.0.0.1:1080
@@ -172,35 +183,39 @@ proxy = ""
 # 批量下载离线镜像数量限制
 maxImages = 10
 
-# Registry映射配置，支持多种镜像仓库上游
+# Registry 代理开关；上游 endpoint 和鉴权 endpoint 在代码中固定维护
 [registries]
 
 # GitHub Container Registry
 [registries."ghcr.io"]
-upstream = "ghcr.io"
-authHost = "ghcr.io/token" 
-authType = "github"
+enabled = true
+
+# Docker Hub
+[registries."docker.io"]
+enabled = true
+
+# Elastic Container Registry
+[registries."docker.elastic.co"]
 enabled = true
 
 # Google Container Registry
 [registries."gcr.io"]
-upstream = "gcr.io"
-authHost = "gcr.io/v2/token"
-authType = "google"
+enabled = true
+
+# Microsoft Container Registry
+[registries."mcr.microsoft.com"]
+enabled = true
+
+# NVIDIA Container Registry
+[registries."nvcr.io"]
 enabled = true
 
 # Quay.io Container Registry
 [registries."quay.io"]
-upstream = "quay.io"
-authHost = "quay.io/v2/auth"
-authType = "quay"
 enabled = true
 
 # Kubernetes Container Registry
 [registries."registry.k8s.io"]
-upstream = "registry.k8s.io"
-authHost = "registry.k8s.io"
-authType = "anonymous"
 enabled = true
 
 [tokenCache]
@@ -214,7 +229,7 @@ defaultTTL = "20m"
 
 ### 环境变量（可选）
 
-支持通过环境变量覆盖部分配置，优先级高于`config.toml`，以下是默认值：
+HubProxy 进程支持通过环境变量覆盖部分配置，优先级高于`config.toml`，以下是默认值。Docker Compose 部署时，`.env` 默认只用于 `HUBPROXY_IMAGE` 和 `HUBPROXY_PORT`；应用配置请改 `config.toml` 后运行 `make reload`。
 
 ```
 CONFIG_PATH=config.toml          # 配置文件路径
@@ -225,8 +240,8 @@ ENABLE_FRONTEND=true            # 是否启用前端静态页面
 MAX_FILE_SIZE=2147483648        # GitHub 文件大小限制（字节）
 RATE_LIMIT=500                  # 每周期请求数
 RATE_PERIOD_HOURS=3             # 限流周期（小时）
-IP_WHITELIST=127.0.0.1,192.168.1.0/24   # IP 白名单（逗号分隔）
-IP_BLACKLIST=192.168.100.1,192.168.100.0/24 # IP 黑名单（逗号分隔）
+IP_WHITELIST=                  # IP 白名单（逗号分隔）
+IP_BLACKLIST=                  # IP 黑名单（逗号分隔）
 MAX_IMAGES=10                   # 批量下载镜像数量限制
 ACCESS_PROXY=                   # 代理配置，例如 socks5://127.0.0.1:1080
 ```

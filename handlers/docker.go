@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -24,47 +25,194 @@ type DockerProxy struct {
 
 var dockerProxy *DockerProxy
 
+type registryEndpoint struct {
+	Domain       string
+	Upstream     string
+	AuthHost     string
+	AuthType     string
+	HostAliases  []string
+	AuthServices []string
+}
+
+var registryEndpoints = map[string]registryEndpoint{
+	"docker.io": {
+		Domain:       "docker.io",
+		Upstream:     "registry-1.docker.io",
+		AuthHost:     "auth.docker.io/token",
+		AuthType:     "docker",
+		HostAliases:  []string{"registry-1.docker.io", "index.docker.io"},
+		AuthServices: []string{"registry.docker.io", "auth.docker.io", "index.docker.io", "docker.io"},
+	},
+	"docker.elastic.co": {
+		Domain:   "docker.elastic.co",
+		Upstream: "docker.elastic.co",
+		AuthHost: "docker-auth.elastic.co/auth",
+		AuthType: "elastic",
+	},
+	"gcr.io": {
+		Domain:       "gcr.io",
+		Upstream:     "gcr.io",
+		AuthHost:     "gcr.io/v2/token",
+		AuthType:     "google",
+		AuthServices: []string{"gcr.io"},
+	},
+	"ghcr.io": {
+		Domain:       "ghcr.io",
+		Upstream:     "ghcr.io",
+		AuthHost:     "ghcr.io/token",
+		AuthType:     "github",
+		AuthServices: []string{"ghcr.io"},
+	},
+	"mcr.microsoft.com": {
+		Domain:   "mcr.microsoft.com",
+		Upstream: "mcr.microsoft.com",
+		AuthType: "anonymous",
+	},
+	"nvcr.io": {
+		Domain:   "nvcr.io",
+		Upstream: "nvcr.io",
+		AuthHost: "nvcr.io/proxy_auth",
+		AuthType: "nvcr",
+	},
+	"quay.io": {
+		Domain:       "quay.io",
+		Upstream:     "quay.io",
+		AuthHost:     "quay.io/v2/auth",
+		AuthType:     "quay",
+		AuthServices: []string{"quay.io"},
+	},
+	"registry.k8s.io": {
+		Domain:   "registry.k8s.io",
+		Upstream: "registry.k8s.io",
+		AuthType: "anonymous",
+	},
+}
+
 // RegistryDetector Registry检测器
 type RegistryDetector struct{}
 
-// detectRegistryDomain 检测Registry域名并返回域名和剩余路径
-func (rd *RegistryDetector) detectRegistryDomain(c *gin.Context, path string) (string, string) {
-	cfg := config.GetConfig()
+type detectedRegistryRoute struct {
+	domain        string
+	remainingPath string
+	known         bool
+	enabled       bool
+}
 
+// detectRegistryRoute 检测Registry域名并返回路由状态
+func (rd *RegistryDetector) detectRegistryRoute(c *gin.Context, path string) detectedRegistryRoute {
 	// 兼容Containerd的ns参数
 	if ns := c.Query("ns"); ns != "" {
-		if mapping, exists := cfg.Registries[ns]; exists && mapping.Enabled {
-			return ns, path
+		if domain, exists := findRegistryByHost(ns); exists {
+			return detectedRegistryRoute{
+				domain:        domain,
+				remainingPath: path,
+				known:         true,
+				enabled:       rd.isRegistryEnabled(domain),
+			}
 		}
 	}
 
-	for domain := range cfg.Registries {
-		if strings.HasPrefix(path, domain+"/") {
-			remainingPath := strings.TrimPrefix(path, domain+"/")
-			return domain, remainingPath
+	for _, domain := range supportedRegistryDomains() {
+		for _, prefix := range registryPathPrefixes(registryEndpoints[domain]) {
+			if strings.HasPrefix(path, prefix+"/") {
+				return detectedRegistryRoute{
+					domain:        domain,
+					remainingPath: strings.TrimPrefix(path, prefix+"/"),
+					known:         true,
+					enabled:       rd.isRegistryEnabled(domain),
+				}
+			}
 		}
 	}
 
-	return "", path
+	return detectedRegistryRoute{remainingPath: path}
 }
 
 // isRegistryEnabled 检查Registry是否启用
 func (rd *RegistryDetector) isRegistryEnabled(domain string) bool {
+	canonicalDomain, exists := findRegistryByHost(domain)
+	if !exists {
+		return false
+	}
+
 	cfg := config.GetConfig()
-	if mapping, exists := cfg.Registries[domain]; exists {
+	if mapping, exists := cfg.Registries[canonicalDomain]; exists {
 		return mapping.Enabled
 	}
-	return false
+	return true
 }
 
-// getRegistryMapping 获取Registry映射配置
-func (rd *RegistryDetector) getRegistryMapping(domain string) (config.RegistryMapping, bool) {
-	cfg := config.GetConfig()
-	mapping, exists := cfg.Registries[domain]
-	return mapping, exists && mapping.Enabled
+func (rd *RegistryDetector) getRegistryEndpoint(domain string) (registryEndpoint, bool) {
+	canonicalDomain, exists := findRegistryByHost(domain)
+	if !exists || !rd.isRegistryEnabled(canonicalDomain) {
+		return registryEndpoint{}, false
+	}
+	return registryEndpoints[canonicalDomain], true
 }
 
 var registryDetector = &RegistryDetector{}
+
+func supportedRegistryDomains() []string {
+	domains := make([]string, 0, len(registryEndpoints))
+	for domain := range registryEndpoints {
+		domains = append(domains, domain)
+	}
+	sort.Strings(domains)
+	return domains
+}
+
+func registryPathPrefixes(endpoint registryEndpoint) []string {
+	prefixes := []string{endpoint.Domain}
+	prefixes = append(prefixes, endpoint.HostAliases...)
+	return prefixes
+}
+
+func findRegistryByHost(candidate string) (string, bool) {
+	host := normalizeRegistryHost(candidate)
+	if host == "" {
+		return "", false
+	}
+
+	for _, domain := range supportedRegistryDomains() {
+		endpoint := registryEndpoints[domain]
+		if host == endpoint.Domain || host == normalizeRegistryHost(endpoint.Upstream) {
+			return domain, true
+		}
+		for _, alias := range endpoint.HostAliases {
+			if host == normalizeRegistryHost(alias) {
+				return domain, true
+			}
+		}
+	}
+
+	return "", false
+}
+
+func findRegistryByAuthCandidate(candidate string) (registryEndpoint, bool) {
+	host := normalizeRegistryHost(candidate)
+	if host == "" {
+		return registryEndpoint{}, false
+	}
+
+	for _, domain := range supportedRegistryDomains() {
+		endpoint := registryEndpoints[domain]
+		if host == endpoint.Domain || host == normalizeRegistryHost(endpoint.Upstream) || host == normalizeRegistryHost(endpoint.AuthHost) {
+			return endpoint, true
+		}
+		for _, alias := range endpoint.HostAliases {
+			if host == normalizeRegistryHost(alias) {
+				return endpoint, true
+			}
+		}
+		for _, service := range endpoint.AuthServices {
+			if host == normalizeRegistryHost(service) {
+				return endpoint, true
+			}
+		}
+	}
+
+	return registryEndpoint{}, false
+}
 
 func logDockerProxy(c *gin.Context, format string, args ...interface{}) {
 	logArgs := append([]interface{}{
@@ -126,15 +274,19 @@ func ProxyDockerRegistryGin(c *gin.Context) {
 func handleRegistryRequest(c *gin.Context, path string) {
 	pathWithoutV2 := strings.TrimPrefix(path, "/v2/")
 
-	if registryDomain, remainingPath := registryDetector.detectRegistryDomain(c, pathWithoutV2); registryDomain != "" {
-		if registryDetector.isRegistryEnabled(registryDomain) {
-			c.Set("target_registry_domain", registryDomain)
-			c.Set("target_path", remainingPath)
-			logDockerProxy(c, "event=registry_route registry=%s remaining=%s source=%s", registryDomain, remainingPath, registryRouteSource(c, pathWithoutV2, registryDomain))
-
-			handleMultiRegistryRequest(c, registryDomain, remainingPath)
+	route := registryDetector.detectRegistryRoute(c, pathWithoutV2)
+	if route.known {
+		if !route.enabled {
+			logDockerProxy(c, "event=registry_disabled registry=%s remaining=%s source=%s status=403", route.domain, route.remainingPath, registryRouteSource(c, pathWithoutV2, route.domain))
+			c.String(http.StatusForbidden, "Registry disabled")
 			return
 		}
+		c.Set("target_registry_domain", route.domain)
+		c.Set("target_path", route.remainingPath)
+		logDockerProxy(c, "event=registry_route registry=%s remaining=%s source=%s", route.domain, route.remainingPath, registryRouteSource(c, pathWithoutV2, route.domain))
+
+		handleMultiRegistryRequest(c, route.domain, route.remainingPath)
+		return
 	}
 
 	imageName, apiType, reference := parseRegistryPath(pathWithoutV2)
@@ -174,11 +326,17 @@ func handleRegistryRequest(c *gin.Context, path string) {
 }
 
 func registryRouteSource(c *gin.Context, path, registryDomain string) string {
-	if c.Query("ns") == registryDomain {
-		return "containerd_ns"
+	if ns := c.Query("ns"); ns != "" {
+		if domain, exists := findRegistryByHost(ns); exists && domain == registryDomain {
+			return "containerd_ns"
+		}
 	}
-	if strings.HasPrefix(path, registryDomain+"/") {
-		return "path_prefix"
+	if endpoint, exists := registryEndpoints[registryDomain]; exists {
+		for _, prefix := range registryPathPrefixes(endpoint) {
+			if strings.HasPrefix(path, prefix+"/") {
+				return "path_prefix"
+			}
+		}
 	}
 	return "unknown"
 }
@@ -455,6 +613,10 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 	defer resp.Body.Close()
 
 	proxyBaseURL := getProxyBaseURL(c)
+	authRegistryDomain := ""
+	if endpoint, found := detectAuthRegistryEndpoint(c); found {
+		authRegistryDomain = endpoint.Domain
+	}
 
 	connectionHeaders := connectionHeaderNames(resp.Header)
 	for key, values := range resp.Header {
@@ -463,7 +625,7 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 				continue
 			}
 			if strings.EqualFold(key, "WWW-Authenticate") {
-				value = rewriteAuthHeader(value, proxyBaseURL)
+				value = rewriteAuthHeader(value, proxyBaseURL, authRegistryDomain)
 			}
 			c.Writer.Header().Add(key, value)
 		}
@@ -478,53 +640,91 @@ func proxyDockerAuthOriginal(c *gin.Context) {
 }
 
 func buildDockerAuthURL(c *gin.Context) (string, error) {
-	if mapping, found := detectAuthRegistryMapping(c); found {
-		logDockerProxy(c, "event=auth_mapping_selected service=%s auth_host=%s upstream=%s auth_type=%s", c.Query("service"), mapping.AuthHost, mapping.Upstream, mapping.AuthType)
-		return buildMappedAuthURL(c, mapping), nil
+	if domain, disabled := detectDisabledAuthRegistry(c); disabled {
+		return "", fmt.Errorf("registry %q is disabled", domain)
+	}
+
+	if endpoint, found := detectAuthRegistryEndpoint(c); found {
+		logDockerProxy(c, "event=auth_mapping_selected registry=%s service=%s auth_host=%s upstream=%s auth_type=%s ns=%s", endpoint.Domain, c.Query("service"), endpoint.AuthHost, endpoint.Upstream, endpoint.AuthType, c.Query("ns"))
+		return buildMappedAuthURL(c, endpoint)
 	}
 
 	service := strings.TrimSpace(c.Query("service"))
-	if hasAuthorization(c) && !isDockerHubAuthService(service) {
+	if isDockerHubAuthService(service) {
+		if !registryDetector.isRegistryEnabled("docker.io") {
+			return "", fmt.Errorf("registry %q is disabled", "docker.io")
+		}
+	} else if hasAuthorization(c) {
 		return "", fmt.Errorf("unsupported auth service %q", service)
 	}
 
 	authURL := "https://auth.docker.io" + c.Request.URL.Path
-	if c.Request.URL.RawQuery != "" {
-		authURL += "?" + c.Request.URL.RawQuery
+	if rawQuery := authRequestRawQuery(c); rawQuery != "" {
+		authURL += "?" + rawQuery
 	}
 	return authURL, nil
 }
 
-func detectAuthRegistryMapping(c *gin.Context) (config.RegistryMapping, bool) {
+func detectDisabledAuthRegistry(c *gin.Context) (string, bool) {
 	if targetDomain, exists := c.Get("target_registry_domain"); exists {
-		if mapping, found := registryDetector.getRegistryMapping(targetDomain.(string)); found {
-			return mapping, true
+		if domain, found := findRegistryByHost(targetDomain.(string)); found && !registryDetector.isRegistryEnabled(domain) {
+			return domain, true
 		}
 	}
 
-	cfg := config.GetConfig()
-	for _, candidate := range []string{c.Query("service"), c.Query("ns")} {
+	if ns := strings.TrimSpace(c.Query("ns")); ns != "" {
+		if domain, found := findRegistryByHost(ns); found && !registryDetector.isRegistryEnabled(domain) {
+			return domain, true
+		}
+	}
+
+	for _, candidate := range []string{c.Query("service"), c.Query("realm")} {
 		candidate = strings.TrimSpace(candidate)
 		if candidate == "" {
 			continue
 		}
-		if mapping, exists := cfg.Registries[candidate]; exists && mapping.Enabled {
-			return mapping, true
+		if endpoint, found := findRegistryByAuthCandidate(candidate); found && !registryDetector.isRegistryEnabled(endpoint.Domain) {
+			return endpoint.Domain, true
 		}
-		for _, mapping := range cfg.Registries {
-			if mapping.Enabled && normalizeRegistryHost(mapping.Upstream) == candidate {
-				return mapping, true
+	}
+
+	return "", false
+}
+
+func detectAuthRegistryEndpoint(c *gin.Context) (registryEndpoint, bool) {
+	if targetDomain, exists := c.Get("target_registry_domain"); exists {
+		if endpoint, found := registryDetector.getRegistryEndpoint(targetDomain.(string)); found {
+			return endpoint, true
+		}
+	}
+
+	if ns := strings.TrimSpace(c.Query("ns")); ns != "" {
+		if domain, found := findRegistryByHost(ns); found {
+			if endpoint, enabled := registryDetector.getRegistryEndpoint(domain); enabled {
+				return endpoint, true
 			}
 		}
 	}
 
-	return config.RegistryMapping{}, false
+	for _, candidate := range []string{c.Query("service"), c.Query("realm")} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "" {
+			continue
+		}
+		if endpoint, found := findRegistryByAuthCandidate(candidate); found {
+			if enabledEndpoint, enabled := registryDetector.getRegistryEndpoint(endpoint.Domain); enabled {
+				return enabledEndpoint, true
+			}
+		}
+	}
+
+	return registryEndpoint{}, false
 }
 
-func buildMappedAuthURL(c *gin.Context, mapping config.RegistryMapping) string {
-	rawAuthHost := strings.TrimSpace(mapping.AuthHost)
+func buildMappedAuthURL(c *gin.Context, endpoint registryEndpoint) (string, error) {
+	rawAuthHost := strings.TrimSpace(endpoint.AuthHost)
 	if rawAuthHost == "" {
-		rawAuthHost = strings.TrimSpace(mapping.Upstream)
+		return "", fmt.Errorf("registry %q does not use a token auth endpoint", endpoint.Domain)
 	}
 	if !strings.Contains(rawAuthHost, "://") {
 		rawAuthHost = "https://" + rawAuthHost
@@ -532,33 +732,45 @@ func buildMappedAuthURL(c *gin.Context, mapping config.RegistryMapping) string {
 
 	parsed, err := url.Parse(rawAuthHost)
 	if err != nil || parsed.Host == "" {
-		return "https://auth.docker.io" + c.Request.URL.RequestURI()
+		return "", fmt.Errorf("invalid auth endpoint for registry %q", endpoint.Domain)
 	}
 	if parsed.Path == "" || parsed.Path == "/" {
 		parsed.Path = c.Request.URL.Path
 	}
-	parsed.RawQuery = c.Request.URL.RawQuery
+	parsed.RawQuery = authRequestRawQuery(c)
 
-	return parsed.String()
+	return parsed.String(), nil
+}
+
+func supportsTokenProxy(endpoint registryEndpoint) bool {
+	return strings.TrimSpace(endpoint.AuthHost) != ""
+}
+
+func authRequestRawQuery(c *gin.Context) string {
+	query := c.Request.URL.Query()
+	query.Del("ns")
+	return query.Encode()
 }
 
 func isDockerHubAuthService(service string) bool {
-	switch service {
-	case "registry.docker.io", "auth.docker.io", "index.docker.io", "docker.io":
-		return true
-	default:
-		return false
+	endpoint := registryEndpoints["docker.io"]
+	service = normalizeRegistryHost(service)
+	for _, candidate := range append(endpoint.AuthServices, endpoint.Domain, endpoint.Upstream) {
+		if service == normalizeRegistryHost(candidate) {
+			return true
+		}
 	}
+	return false
 }
 
 // rewriteAuthHeader 重写认证头
-func rewriteAuthHeader(authHeader, proxyBaseURL string) string {
+func rewriteAuthHeader(authHeader, proxyBaseURL, registryDomain string) string {
 	bearerStart := findBearerChallengeStart(authHeader)
 	if bearerStart == -1 {
 		return authHeader
 	}
 
-	return authHeader[:bearerStart] + rewriteAuthRealm(authHeader[bearerStart:], proxyBaseURL)
+	return authHeader[:bearerStart] + rewriteAuthRealm(authHeader[bearerStart:], proxyBaseURL, registryDomain)
 }
 
 func findBearerChallengeStart(authHeader string) int {
@@ -585,8 +797,8 @@ func findBearerChallengeStart(authHeader string) int {
 	return -1
 }
 
-func rewriteAuthRealm(authHeader, proxyBaseURL string) string {
-	realm := strings.TrimRight(proxyBaseURL, "/") + "/token"
+func rewriteAuthRealm(authHeader, proxyBaseURL, registryDomain string) string {
+	realm := buildProxyTokenRealm(proxyBaseURL, registryDomain)
 	lower := strings.ToLower(authHeader)
 	idx := strings.Index(lower, "realm=")
 	if idx == -1 {
@@ -613,6 +825,22 @@ func rewriteAuthRealm(authHeader, proxyBaseURL string) string {
 	}
 	valueEnd += valueStart
 	return authHeader[:valueStart] + `"` + realm + `"` + authHeader[valueEnd:]
+}
+
+func buildProxyTokenRealm(proxyBaseURL, registryDomain string) string {
+	realm := strings.TrimRight(proxyBaseURL, "/") + "/token"
+	if registryDomain == "" {
+		return realm
+	}
+
+	parsed, err := url.Parse(realm)
+	if err != nil {
+		return realm + "?ns=" + url.QueryEscape(registryDomain)
+	}
+	query := parsed.Query()
+	query.Set("ns", registryDomain)
+	parsed.RawQuery = query.Encode()
+	return parsed.String()
 }
 
 func getProxyBaseURL(c *gin.Context) string {
@@ -662,9 +890,9 @@ func requestScheme(c *gin.Context) string {
 
 // handleMultiRegistryRequest 处理多Registry请求
 func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath string) {
-	mapping, exists := registryDetector.getRegistryMapping(registryDomain)
+	endpoint, exists := registryDetector.getRegistryEndpoint(registryDomain)
 	if !exists {
-		logDockerProxy(c, "event=registry_mapping_missing registry=%s status=400", registryDomain)
+		logDockerProxy(c, "event=registry_endpoint_missing registry=%s status=400", registryDomain)
 		c.String(http.StatusBadRequest, "Registry not configured")
 		return
 	}
@@ -694,8 +922,8 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 		return
 	}
 
-	logDockerProxy(c, "event=multi_registry_proxy_start registry=%s upstream=%s auth_type=%s image=%s api=%s has_auth=%t", registryDomain, mapping.Upstream, mapping.AuthType, fullImageName, apiType, hasAuthorization(c))
-	if err := proxyUpstreamRegistryRequest(c, mapping, remainingPath); err != nil {
+	logDockerProxy(c, "event=multi_registry_proxy_start registry=%s upstream=%s auth_type=%s image=%s api=%s has_auth=%t", registryDomain, endpoint.Upstream, endpoint.AuthType, fullImageName, apiType, hasAuthorization(c))
+	if err := proxyUpstreamRegistryRequest(c, endpoint, remainingPath); err != nil {
 		fmt.Printf("代理上游Registry失败: %v\n", err)
 		logDockerProxy(c, "event=multi_registry_proxy_error registry=%s image=%s api=%s error=%q status=502", registryDomain, fullImageName, apiType, err)
 		c.String(http.StatusBadGateway, "Upstream registry request failed")
@@ -703,8 +931,8 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 	}
 }
 
-func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping, remainingPath string) error {
-	upstreamURL, err := buildUpstreamRegistryURL(c, mapping, remainingPath)
+func proxyUpstreamRegistryRequest(c *gin.Context, endpoint registryEndpoint, remainingPath string) error {
+	upstreamURL, err := buildUpstreamRegistryURL(c, endpoint, remainingPath)
 	if err != nil {
 		return err
 	}
@@ -731,8 +959,8 @@ func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping
 			continue
 		}
 		for _, value := range values {
-			if strings.EqualFold(key, "WWW-Authenticate") {
-				value = rewriteAuthHeader(value, proxyBaseURL)
+			if strings.EqualFold(key, "WWW-Authenticate") && supportsTokenProxy(endpoint) {
+				value = rewriteAuthHeader(value, proxyBaseURL, endpoint.Domain)
 			}
 			c.Writer.Header().Add(key, value)
 		}
@@ -753,8 +981,8 @@ func proxyUpstreamRegistryRequest(c *gin.Context, mapping config.RegistryMapping
 	return nil
 }
 
-func buildUpstreamRegistryURL(c *gin.Context, mapping config.RegistryMapping, remainingPath string) (string, error) {
-	rawUpstream := strings.TrimSpace(mapping.Upstream)
+func buildUpstreamRegistryURL(c *gin.Context, endpoint registryEndpoint, remainingPath string) (string, error) {
+	rawUpstream := strings.TrimSpace(endpoint.Upstream)
 	if rawUpstream == "" {
 		return "", fmt.Errorf("empty upstream registry")
 	}
@@ -767,7 +995,7 @@ func buildUpstreamRegistryURL(c *gin.Context, mapping config.RegistryMapping, re
 		return "", err
 	}
 	if parsed.Host == "" {
-		return "", fmt.Errorf("invalid upstream registry %q", mapping.Upstream)
+		return "", fmt.Errorf("invalid upstream registry %q", endpoint.Upstream)
 	}
 
 	basePath := strings.TrimRight(parsed.Path, "/")
@@ -834,157 +1062,4 @@ func normalizeRegistryHost(raw string) string {
 		return ""
 	}
 	return parsed.Host
-}
-
-// handleUpstreamManifestRequest 处理上游Registry的manifest请求
-func handleUpstreamManifestRequest(c *gin.Context, imageRef, reference string, mapping config.RegistryMapping) {
-	if utils.IsCacheEnabled() && c.Request.Method == http.MethodGet {
-		cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
-
-		if cachedItem := utils.GlobalCache.Get(cacheKey); cachedItem != nil {
-			utils.WriteCachedResponse(c, cachedItem)
-			return
-		}
-	}
-
-	var ref name.Reference
-	var err error
-
-	if strings.HasPrefix(reference, "sha256:") {
-		ref, err = name.NewDigest(fmt.Sprintf("%s@%s", imageRef, reference))
-	} else {
-		ref, err = name.NewTag(fmt.Sprintf("%s:%s", imageRef, reference))
-	}
-
-	if err != nil {
-		fmt.Printf("解析镜像引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid reference")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-
-	if c.Request.Method == http.MethodHead {
-		desc, err := remote.Head(ref, options...)
-		if err != nil {
-			fmt.Printf("HEAD请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
-			return
-		}
-
-		c.Header("Content-Type", string(desc.MediaType))
-		c.Header("Docker-Content-Digest", desc.Digest.String())
-		c.Header("Content-Length", fmt.Sprintf("%d", desc.Size))
-		c.Status(http.StatusOK)
-	} else {
-		desc, err := remote.Get(ref, options...)
-		if err != nil {
-			fmt.Printf("GET请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
-			return
-		}
-
-		headers := map[string]string{
-			"Docker-Content-Digest": desc.Digest.String(),
-			"Content-Length":        fmt.Sprintf("%d", len(desc.Manifest)),
-		}
-
-		if utils.IsCacheEnabled() {
-			cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
-			ttl := utils.GetManifestTTL(reference)
-			utils.GlobalCache.Set(cacheKey, desc.Manifest, string(desc.MediaType), headers, ttl)
-		}
-
-		c.Header("Content-Type", string(desc.MediaType))
-		for key, value := range headers {
-			c.Header(key, value)
-		}
-
-		c.Data(http.StatusOK, string(desc.MediaType), desc.Manifest)
-	}
-}
-
-// handleUpstreamBlobRequest 处理上游Registry的blob请求
-func handleUpstreamBlobRequest(c *gin.Context, imageRef, digest string, mapping config.RegistryMapping) {
-	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
-	if err != nil {
-		fmt.Printf("解析digest引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid digest reference")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-	layer, err := remote.Layer(digestRef, options...)
-	if err != nil {
-		fmt.Printf("获取layer失败: %v\n", err)
-		c.String(http.StatusNotFound, "Layer not found")
-		return
-	}
-
-	size, err := layer.Size()
-	if err != nil {
-		fmt.Printf("获取layer大小失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer size")
-		return
-	}
-
-	reader, err := layer.Compressed()
-	if err != nil {
-		fmt.Printf("获取layer内容失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer content")
-		return
-	}
-	defer reader.Close()
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", size))
-	c.Header("Docker-Content-Digest", digest)
-
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, reader); err != nil {
-		fmt.Printf("复制layer内容失败: %v\n", err)
-	}
-}
-
-// handleUpstreamTagsRequest 处理上游Registry的tags请求
-func handleUpstreamTagsRequest(c *gin.Context, imageRef string, mapping config.RegistryMapping) {
-	repo, err := name.NewRepository(imageRef)
-	if err != nil {
-		fmt.Printf("解析repository失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid repository")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-	tags, err := remote.List(repo, options...)
-	if err != nil {
-		fmt.Printf("获取tags失败: %v\n", err)
-		c.String(http.StatusNotFound, "Tags not found")
-		return
-	}
-
-	response := map[string]interface{}{
-		"name": strings.TrimPrefix(imageRef, mapping.Upstream+"/"),
-		"tags": tags,
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-// createUpstreamOptions 创建上游Registry选项
-func createUpstreamOptions(mapping config.RegistryMapping) []remote.Option {
-	options := []remote.Option{
-		remote.WithAuth(authn.Anonymous),
-		remote.WithUserAgent("hubproxy/go-containerregistry"),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
-	}
-
-	// 预留将来不同Registry的差异化认证逻辑扩展点
-	switch mapping.AuthType {
-	case "github":
-	case "google":
-	case "quay":
-	}
-
-	return options
 }

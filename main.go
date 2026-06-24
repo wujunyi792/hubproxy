@@ -2,9 +2,11 @@ package main
 
 import (
 	"embed"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -93,6 +95,17 @@ func buildRouter(cfg *config.AppConfig) *gin.Engine {
 }
 
 func main() {
+	validateConfigPath := flag.String("validate-config", "", "validate a config file and exit")
+	flag.Parse()
+	if *validateConfigPath != "" {
+		if err := config.ValidateConfigFile(*validateConfigPath); err != nil {
+			fmt.Printf("配置校验失败: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("配置校验成功: %s\n", *validateConfigPath)
+		return
+	}
+
 	if err := config.LoadConfig(); err != nil {
 		fmt.Printf("配置加载失败: %v\n", err)
 		return

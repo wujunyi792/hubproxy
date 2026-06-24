@@ -1,0 +1,6 @@
+.git
+.env
+config.toml
+hubproxy*
+*.exe
+.DS_Store

@@ -13,10 +13,7 @@ import (
 
 // RegistryMapping Registry映射配置
 type RegistryMapping struct {
-	Upstream string `toml:"upstream"`
-	AuthHost string `toml:"authHost"`
-	AuthType string `toml:"authType"`
-	Enabled  bool   `toml:"enabled"`
+	Enabled bool `toml:"enabled"`
 }
 
 // AppConfig 应用配置结构体
@@ -113,28 +110,28 @@ func DefaultConfig() *AppConfig {
 		},
 		Registries: map[string]RegistryMapping{
 			"ghcr.io": {
-				Upstream: "ghcr.io",
-				AuthHost: "ghcr.io/token",
-				AuthType: "github",
-				Enabled:  true,
+				Enabled: true,
+			},
+			"docker.io": {
+				Enabled: true,
+			},
+			"docker.elastic.co": {
+				Enabled: true,
 			},
 			"gcr.io": {
-				Upstream: "gcr.io",
-				AuthHost: "gcr.io/v2/token",
-				AuthType: "google",
-				Enabled:  true,
+				Enabled: true,
+			},
+			"mcr.microsoft.com": {
+				Enabled: true,
+			},
+			"nvcr.io": {
+				Enabled: true,
 			},
 			"quay.io": {
-				Upstream: "quay.io",
-				AuthHost: "quay.io/v2/auth",
-				AuthType: "quay",
-				Enabled:  true,
+				Enabled: true,
 			},
 			"registry.k8s.io": {
-				Upstream: "registry.k8s.io",
-				AuthHost: "registry.k8s.io",
-				AuthType: "anonymous",
-				Enabled:  true,
+				Enabled: true,
 			},
 		},
 		TokenCache: struct {
@@ -219,6 +216,18 @@ func LoadConfig() error {
 	overrideFromEnv(cfg)
 	setConfig(cfg)
 
+	return nil
+}
+
+func ValidateConfigFile(path string) error {
+	cfg := DefaultConfig()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("读取配置文件 %s 失败: %v", path, err)
+	}
+	if err := toml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("解析配置文件 %s 失败: %v", path, err)
+	}
 	return nil
 }
 

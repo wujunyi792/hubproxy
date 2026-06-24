@@ -2,4 +2,6 @@
 .vscode
 .DS_Store
 /hubproxy*
+/config.toml
+/.env
 *.exe
