@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -945,10 +946,20 @@ func proxyUpstreamRegistryRequest(c *gin.Context, endpoint registryEndpoint, rem
 	copyProxyRequestHeaders(req.Header, c.Request.Header)
 	logDockerProxy(c, "event=upstream_registry_request target=%s ns_stripped=%t has_auth=%t accept=%q", upstreamURL, nsWasPresent, hasAuthorization(c), c.GetHeader("Accept"))
 
-	resp, err := utils.GetGlobalHTTPClient().Do(req)
+	client := utils.GetGlobalHTTPClient()
+	cancel := func() {}
+	var resp *http.Response
+	blob := isRegistryBlobGET(req)
+	if blob {
+		req.Header.Set("Accept-Encoding", "identity")
+		resp, cancel, err = openRegistryBlob(client, req, blobReadTimeout)
+	} else {
+		resp, err = client.Do(req)
+	}
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	defer resp.Body.Close()
 	logDockerProxy(c, "event=upstream_registry_response target=%s upstream_status=%d challenge=%t digest=%s content_type=%s content_length=%s", upstreamURL, resp.StatusCode, resp.Header.Get("WWW-Authenticate") != "", resp.Header.Get("Docker-Content-Digest"), resp.Header.Get("Content-Type"), resp.Header.Get("Content-Length"))
 
@@ -969,6 +980,30 @@ func proxyUpstreamRegistryRequest(c *gin.Context, endpoint registryEndpoint, rem
 	c.Status(resp.StatusCode)
 	if c.Request.Method == http.MethodHead {
 		logDockerProxy(c, "event=upstream_registry_head_complete target=%s status=%d", upstreamURL, resp.StatusCode)
+		return nil
+	}
+
+	if blob && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+		start := time.Now()
+		result, streamErr := streamRegistryBlob(c.Request.Context(), c.Writer, client, req, resp, cancel, blobReadTimeout)
+		event := "upstream_registry_stream_complete"
+		if streamErr != nil {
+			event = "upstream_registry_stream_error"
+		}
+		logDockerProxy(c, "event=%s target=%s status=%d bytes=%d expected_bytes=%d resumes=%d duration_ms=%d failure=%s error_kind=%s",
+			event, upstreamURL, resp.StatusCode, result.bytes, result.expected, result.resumes,
+			time.Since(start).Milliseconds(), result.failure, blobErrorKind(streamErr))
+		if streamErr != nil {
+			if c.Writer.Written() {
+				// The 200/206 headers are already sent: abort the stream rather
+				// than append an error page or let a partial body finish normally.
+				panic(http.ErrAbortHandler)
+			}
+			for key := range c.Writer.Header() {
+				c.Writer.Header().Del(key)
+			}
+			return errors.New("upstream blob transfer failed")
+		}
 		return nil
 	}
 

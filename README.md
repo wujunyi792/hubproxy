@@ -86,6 +86,22 @@ HUBPROXY_IMAGE=ghcr.io/wujunyi792/hubproxy:0.1.1 HUBPROXY_PORT=5000 make up
 
 Docker Compose 会强制容器内 HubProxy 监听 `5000`，宿主机端口请改 `HUBPROXY_PORT`，不要通过 `config.toml` 的 `server.port` 改容器内端口。
 
+### 大镜像层断流恢复
+
+GHCR 等多 Registry 转发路径的 `GET /v2/<仓库>/blobs/sha256:<摘要>` 支持流式续传。
+上游读取提前结束或连续 45 秒未返回新数据时，从已发送字节之后发起 Range 请求，
+最多续传 3 次，并使用 0.2、0.4、0.6 秒的退避。只有长度已知、未做内容编码转换的
+响应可以续传；续传必须返回范围和总长度均一致的 `206`。客户端自己请求部分字节时，
+续传也只补齐这个范围。上游忽略 Range、返回错误或范围发生变化时，会停止传输。
+
+每条下载仅使用固定大小缓冲区，不把镜像层全部放进内存或磁盘。
+客户端断开后会取消上游请求，不重试下游写入失败。
+最终无法传完的响应会被中断，不会把错误 JSON 拼到镜像层末尾；响应头已经发出时，
+HTTP 状态码不能改成 502，应以流是否完整、容器客户端的摘要校验及下载事件判断结果。
+`upstream_registry_stream_complete/error` 日志记录 `bytes`、`expected_bytes`、`resumes`、
+`duration_ms`、`failure` 和固定的 `error_kind`，区分上游读取、下游写入和续传拒绝。
+Docker Hub 的独立镜像客户端路径、manifest、tag、鉴权请求和写入请求不套用此续传机制。
+
 ## 使用方法
 
 ### Docker 镜像加速

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,6 +15,35 @@ import (
 	"hubproxy/handlers"
 	"hubproxy/utils"
 )
+
+func TestRecoveryAbortsIncompleteStreamsWithoutAppendingJSON(t *testing.T) {
+	router := newTestRouter(t, "")
+	router.GET("/test-incomplete-stream", func(c *gin.Context) {
+		c.Header("Content-Length", "100")
+		c.Writer.Write([]byte("partial"))
+		c.Writer.Flush()
+		panic(http.ErrAbortHandler)
+	})
+	server := httptest.NewServer(router)
+	defer server.Close()
+	response, err := server.Client().Get(server.URL + "/test-incomplete-stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err == nil || string(body) != "partial" {
+		t.Fatalf("incomplete response was completed or modified: body=%q err=%v", body, err)
+	}
+	ready, err := server.Client().Get(server.URL + "/ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready.Body.Close()
+	if ready.StatusCode != http.StatusOK {
+		t.Fatal("aborting a download damaged the server")
+	}
+}
 
 func newTestRouter(t *testing.T, configBody string) *gin.Engine {
 	t.Helper()

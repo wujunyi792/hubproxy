@@ -44,15 +44,24 @@ func serveEmbedFile(c *gin.Context, filename string) {
 
 func buildRouter(cfg *config.AppConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.Default()
-
-	router.Use(gin.CustomRecovery(func(c *gin.Context, recovered interface{}) {
-		log.Printf("Panic 已恢复: %v", recovered)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Internal server error",
-			"code":  "INTERNAL_ERROR",
-		})
-	}))
+	router := gin.New()
+	router.Use(gin.Logger(), func(c *gin.Context) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// Let net/http reset an incomplete stream. An error JSON body
+				// here would become part of the image layer already being sent.
+				if recovered == http.ErrAbortHandler {
+					panic(recovered)
+				}
+				log.Printf("Panic 已恢复: %v", recovered)
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{
+					"error": "Internal server error",
+					"code":  "INTERNAL_ERROR",
+				})
+			}
+		}()
+		c.Next()
+	})
 
 	router.Use(utils.RateLimitMiddleware(globalLimiter))
 
